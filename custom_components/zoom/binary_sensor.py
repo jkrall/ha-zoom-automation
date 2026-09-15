@@ -1,7 +1,7 @@
 """Sensor platform for Zoom."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from logging import getLogger
 from typing import Any
 
@@ -20,6 +20,7 @@ from homeassistant.helpers.dispatcher import (
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import slugify
+from homeassistant.util.dt import utcnow
 
 from .common import ZoomAPI, ZoomUserProfileDataUpdateCoordinator, get_contact_name
 from .const import (
@@ -39,6 +40,11 @@ _LOGGER = getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(seconds=30)
 PARALLEL_UPDATES = 5
+
+# How long a webhook's status is trusted over the polled one. Zoom's REST API
+# lags its webhooks by a few seconds, so a poll landing right after an event
+# can still report the previous status.
+WEBHOOK_GRACE_PERIOD = timedelta(seconds=60)
 
 
 async def async_setup_entry(
@@ -79,6 +85,7 @@ class ZoomBaseBinarySensor(RestoreEntity, BinarySensorEntity):
         self._name: str = config_entry.data[CONF_NAME]
         self._profile = None
         self._zoom_event_state = None
+        self._last_webhook_dt: datetime | None = None
         self._is_on = False
 
         self._attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
@@ -86,30 +93,49 @@ class ZoomBaseBinarySensor(RestoreEntity, BinarySensorEntity):
         self._attr_available = True
         self._attr_should_poll = False
 
+    def _in_webhook_grace_period(self) -> bool:
+        """Return whether a webhook arrived too recently to be polled over."""
+        return (
+            self._last_webhook_dt is not None
+            and utcnow() - self._last_webhook_dt < WEBHOOK_GRACE_PERIOD
+        )
+
     async def _async_update(self, now) -> None:
         """Update state of entity."""
-        if self.id:
-            try:
-                self._profile = await self._api.async_get_contact_user_profile(self.id)
-                # If API call succeeds but we are unavailable, that means we just regained
-                # connectivity to Zoom so we should do a single poll to update status.
-                if not self._attr_available:
-                    _LOGGER.info(
-                        "We can reach Zoom again, polling for current status in case "
-                        "we missed updates"
-                    )
-                    self._set_state(self._profile["presence_status"])
-                    self._attr_available = True
-                    self.async_write_ha_state()
-            except:
-                # If API call fails we can assume we can't talk to Zoom
-                if self._attr_available:
-                    _LOGGER.warning(
-                        "Unable to reach Zoom, we may miss status updates until we "
-                        "can connect again"
-                    )
-                    self._attr_available = False
-                    self.async_write_ha_state()
+        if not self.id:
+            return
+
+        try:
+            self._profile = await self._api.async_get_contact_user_profile(self.id)
+        except Exception:
+            # If API call fails we can assume we can't talk to Zoom
+            if self._attr_available:
+                _LOGGER.warning(
+                    "Unable to reach Zoom, we may miss status updates until we "
+                    "can connect again"
+                )
+                self._attr_available = False
+                self.async_write_ha_state()
+            return
+
+        if not self._attr_available:
+            _LOGGER.info("We can reach Zoom again, resuming polling for current status")
+            self._attr_available = True
+
+        # A webhook we never receive leaves our state wrong until the next one
+        # arrives, so the poll has to be able to correct it - not only when
+        # recovering from an outage. Skip the correction right after an event,
+        # since the API can still be reporting the status the webhook replaced.
+        status = self._profile.get("presence_status")
+        if status != self._zoom_event_state and not self._in_webhook_grace_period():
+            _LOGGER.debug(
+                "Polled status %s doesn't match last known status %s, correcting",
+                status,
+                self._zoom_event_state,
+            )
+            self._set_state(status)
+
+        self.async_write_ha_state()
 
     async def _restore_state(self) -> None:
         """Restore state from last known state."""
@@ -267,6 +293,7 @@ class ZoomAuthenticatedUserBinarySensor(ZoomBaseBinarySensor):
             and status[ATTR_EVENT] == CONNECTIVITY_EVENT
             and get_data_from_path(status, CONNECTIVITY_ID).lower() == self.id.lower()
         ):
+            self._last_webhook_dt = utcnow()
             self._set_state(get_data_from_path(status, CONNECTIVITY_STATUS))
             self.async_write_ha_state()
 
