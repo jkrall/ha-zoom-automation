@@ -134,3 +134,54 @@ async def test_unavailable_when_zoom_is_unreachable(
     presence["presence_status"] = "In_Meeting"
     await _advance(hass, freezer, 31)
     assert hass.states.get(ENTITY_ID).state == "on"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_poll_translates_the_profile_vocabulary(
+    hass: HomeAssistant, freezer, presence: dict
+) -> None:
+    """Test the profile's spelling of a status is matched against the webhook's.
+
+    The user profile endpoint says "In_A_Meeting" where the webhook says
+    "In_Meeting", and only the webhook's spelling can appear in the configured
+    "on" statuses, so an untranslated poll reads as "not on a call".
+    """
+    MOCK_ENTRY.add_to_hass(hass)
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY_ID).state == "off"
+
+    presence["presence_status"] = "In_A_Meeting"
+    await _advance(hass, freezer, 31)
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.state == "on"
+    assert state.attributes["status"] == "In_Meeting"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_poll_ignores_an_unrecognised_status(
+    hass: HomeAssistant, freezer, presence: dict
+) -> None:
+    """Test a status we can't interpret doesn't clear a state a webhook set.
+
+    A webhook is an event - an unrecognised status is evidence the user is no
+    longer on a call. The poll is only a cross-check, so a status it can't
+    interpret is no evidence at all.
+    """
+    MOCK_ENTRY.add_to_hass(hass)
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    hass.bus.async_fire(HA_ZOOM_EVENT, _presence_event("In_Meeting"))
+    await hass.async_block_till_done()
+    assert hass.states.get(ENTITY_ID).state == "on"
+
+    presence["presence_status"] = "Something_Zoom_Invented"
+    await _advance(hass, freezer, 31)   # inside the grace period
+    await _advance(hass, freezer, 61)   # and outside it
+    await _advance(hass, freezer, 31)
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.state == "on"
+    assert state.attributes["status"] == "In_Meeting"

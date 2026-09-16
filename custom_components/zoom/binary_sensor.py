@@ -24,6 +24,7 @@ from homeassistant.util.dt import utcnow
 
 from .common import ZoomAPI, ZoomUserProfileDataUpdateCoordinator, get_contact_name
 from .const import (
+    ALL_CONNECTIVITY_STATUSES,
     API,
     ATTR_EVENT,
     CONF_CONNECTIVITY_ON_STATUSES,
@@ -33,10 +34,13 @@ from .const import (
     DEFAULT_CONNECTIVITY_ON_STATUSES,
     DOMAIN,
     HA_ZOOM_EVENT,
+    POLLED_STATUS_ALIASES,
     USER_PROFILE_COORDINATOR,
 )
 
 _LOGGER = getLogger(__name__)
+
+ISSUE_URL = "https://github.com/raman325/ha-zoom-automation/issues"
 
 SCAN_INTERVAL = timedelta(seconds=30)
 PARALLEL_UPDATES = 5
@@ -86,6 +90,7 @@ class ZoomBaseBinarySensor(RestoreEntity, BinarySensorEntity):
         self._profile = None
         self._zoom_event_state = None
         self._last_webhook_dt: datetime | None = None
+        self._unknown_status: str | None = None
         self._is_on = False
 
         self._attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
@@ -127,7 +132,25 @@ class ZoomBaseBinarySensor(RestoreEntity, BinarySensorEntity):
         # recovering from an outage. Skip the correction right after an event,
         # since the API can still be reporting the status the webhook replaced.
         status = self._profile.get("presence_status")
-        if status != self._zoom_event_state and not self._in_webhook_grace_period():
+        status = POLLED_STATUS_ALIASES.get(status, status)
+
+        if status not in ALL_CONNECTIVITY_STATUSES:
+            # A webhook is an event - it says the status just became X, and an X
+            # we don't recognise is fair evidence the user isn't on a call. The
+            # poll is only a cross-check, so a status we can't interpret is no
+            # evidence at all and must not be allowed to clear a state a webhook
+            # set. Report it once so it can be added to the aliases above.
+            if status != self._unknown_status:
+                self._unknown_status = status
+                _LOGGER.warning(
+                    "Zoom's user profile reports presence status %s, which this "
+                    "integration doesn't recognise; leaving the state at %s. "
+                    "Please report this at %s",
+                    status,
+                    self._zoom_event_state,
+                    ISSUE_URL,
+                )
+        elif status != self._zoom_event_state and not self._in_webhook_grace_period():
             _LOGGER.debug(
                 "Polled status %s doesn't match last known status %s, correcting",
                 status,
