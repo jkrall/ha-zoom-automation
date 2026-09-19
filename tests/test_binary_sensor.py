@@ -3,10 +3,13 @@
 from datetime import timedelta
 from unittest.mock import patch
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.setup import async_setup_component
 import pytest
-from pytest_homeassistant_custom_component.common import async_fire_time_changed
+from pytest_homeassistant_custom_component.common import (
+    async_fire_time_changed,
+    mock_restore_cache,
+)
 
 from custom_components.zoom.const import (
     ATTR_EVENT,
@@ -60,6 +63,36 @@ async def test_setup(hass: HomeAssistant) -> None:
     assert state is not None
     assert state.state == "off"
     assert state.attributes["status"] == "Available"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_setup_translates_the_profile_vocabulary(
+    hass: HomeAssistant, presence: dict
+) -> None:
+    """Test the initial profile status uses the webhook vocabulary."""
+    presence["presence_status"] = "In_A_Meeting"
+    MOCK_ENTRY.add_to_hass(hass)
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.state == "on"
+    assert state.attributes["status"] == "In_Meeting"
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_setup_restores_state_for_an_unrecognised_status(
+    hass: HomeAssistant, presence: dict
+) -> None:
+    """Test an unknown initial profile status does not clear restored state."""
+    presence["presence_status"] = "Something_Zoom_Invented"
+    mock_restore_cache(hass, [State(ENTITY_ID, "on")])
+    MOCK_ENTRY.add_to_hass(hass)
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    state = hass.states.get(ENTITY_ID)
+    assert state.state == "on"
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
